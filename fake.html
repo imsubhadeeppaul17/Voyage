@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Media Evidence Review</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, Segoe UI, sans-serif;
+      background: #101820;
+      color: #e9f0f3;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 900px; margin: 0 auto; padding: 32px 20px 60px; }
+    h1 { margin-bottom: 8px; font-size: clamp(1.7rem, 4vw, 2.5rem); }
+    p { line-height: 1.55; color: #bdcbd1; }
+    .panel {
+      margin-top: 20px; padding: 20px; border: 1px solid #30424c;
+      border-radius: 14px; background: #17232c;
+    }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    label { display: block; margin-bottom: 7px; font-weight: 650; }
+    input, button {
+      width: 100%; border: 1px solid #425762; border-radius: 8px;
+      padding: 11px; background: #101820; color: #e9f0f3; font: inherit;
+    }
+    input[type="checkbox"] { width: auto; }
+    input[type="file"] { padding: 9px; }
+    button {
+      margin-top: 18px; border: 0; background: #18a999;
+      color: #062522; font-weight: 750; cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: wait; }
+    .hint { margin: 6px 0 0; font-size: .9rem; color: #9fb1b9; }
+    .notice {
+      border-left: 4px solid #e8b04b; padding: 10px 14px;
+      background: #26271f; color: #e8dfc9; border-radius: 4px;
+    }
+    #status { min-height: 1.5em; color: #8fe1d7; }
+    .result-card { margin-top: 14px; padding: 16px; background: #101820; border-radius: 10px; }
+    .result-card h3 { margin: 0 0 8px; }
+    .result-card ul { margin: 8px 0; padding-left: 22px; }
+    .muted { color: #9fb1b9; }
+    .score { color: #8fe1d7; font-weight: 700; }
+    @media (max-width: 650px) {
+      .grid { grid-template-columns: 1fr; }
+      main { padding: 22px 14px 42px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Media Evidence Review</h1>
+  <p>
+    Analyze image or video frames with a browser-compatible classifier and compare
+    them with reference images you select.
+  </p>
+
+  <p class="notice">
+    Results are investigative leads, not proof. Similarity matches only refer to
+    your selected reference images; they do not establish who created or shared
+    the media.
+  </p>
+
+  <section class="panel">
+    <div class="grid">
+      <div>
+        <label for="media">Image or video to review</label>
+        <input id="media" type="file" accept="image/*,video/*">
+      </div>
+      <div>
+        <label for="references">Optional reference images</label>
+        <input id="references" type="file" accept="image/*" multiple>
+        <p class="hint">Similarity matching compares sampled frames with these images.</p>
+      </div>
+      <div>
+        <label for="model">Transformers.js model repository ID</label>
+        <input id="model" type="text" placeholder="publisher/deepfake-model-ONNX">
+        <p class="hint">Use a deepfake classifier with browser-compatible ONNX files.</p>
+      </div>
+      <div>
+        <label for="fakeLabels">Fake class label(s)</label>
+        <input id="fakeLabels" type="text" value="fake, deepfake, manipulated, synthetic, generated">
+        <p class="hint">Comma-separated label text; match is case-insensitive.</p>
+      </div>
+      <div>
+        <label for="frameCount">Video frames to sample</label>
+        <input id="frameCount" type="number" min="1" max="16" value="8">
+      </div>
+      <div>
+        <label for="distance">Reference-match distance (0–64)</label>
+        <input id="distance" type="number" min="0" max="64" value="10">
+      </div>
+    </div>
+
+    <p class="hint">
+      First use downloads the model from Hugging Face and may take time. Your
+      selected media is processed in this page; this page does not upload it.
+    </p>
+
+    <button id="analyze">Analyze media</button>
+    <p id="status" role="status" aria-live="polite"></p>
+  </section>
+
+  <section id="results" class="panel" hidden>
+    <h2>Review results</h2>
+    <div id="resultContent"></div>
+  </section>
+</main>
+
+<script type="module">
+  import { pipeline } from
+    "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
+
+  const mediaInput = document.querySelector("#media");
+  const referenceInput = document.querySelector("#references");
+  const modelInput = document.querySelector("#model");
+  const fakeLabelsInput = document.querySelector("#fakeLabels");
+  const frameCountInput = document.querySelector("#frameCount");
+  const distanceInput = document.querySelector("#distance");
+  const analyzeButton = document.querySelector("#analyze");
+  const status = document.querySelector("#status");
+  const results = document.querySelector("#results");
+  const resultContent = document.querySelector("#resultContent");
+
+  let loadedModelId = "";
+  let classifier = null;
+
+  function setStatus(message) {
+    status.textContent = message;
+  }
+
+  function waitFor(target, eventName) {
+    return new Promise((resolve, reject) => {
+      const onSuccess = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("The media could not be read by this browser."));
+      };
+      const cleanup = () => {
+        target.removeEventListener(eventName, onSuccess);
+        target.removeEventListener("error", onError);
+      };
+      target.addEventListener(eventName, onSuccess, { once: true });
+      target.addEventListener("error", onError, { once: true });
+    });
+  }
+
+  function toCanvas(source) {
+    const width = source.videoWidth || source.naturalWidth || source.width;
+    const height = source.videoHeight || source.naturalHeight || source.height;
+    if (!width || !height) throw new Error("Could not read media dimensions.");
+
+    const scale = Math.min(1, 768 / Math.max(width, height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(width * scale));
+    canvas.height = Math.max(1, Math.round(height * scale));
+    canvas.getContext("2d", { willReadFrequently: true })
+      .drawImage(source, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  }
+
+  async function getFrames(file, maximum) {
+    if (file.type.startsWith("image/")) {
+      const bitmap = await createImageBitmap(file);
+      try {
+        return [{ canvas: toCanvas(bitmap), frameIndex: 0, timeSeconds: 0 }];
+      } finally {
+        bitmap.close();
+      }
+    }
+
+    if (!file.type.startsWith("video/")) {
+      throw new Error("Choose an image or video file supported by your browser.");
+    }
+
+    const video = document.createElement("video");
+    video.muted = true;
+    video.playsInline = true;
+    video.preload = "auto";
+
+    const objectUrl = URL.createObjectURL(file);
+    try {
+      const metadataReady = waitFor(video, "loadedmetadata");
+      const frameReady = waitFor(video, "loadeddata");
+      video.src = objectUrl;
+      await metadataReady;
+      await frameReady;
+
+      if (!Number.isFinite(video.duration) || video.duration <= 0) {
+        throw new Error("Could not determine the video duration.");
+      }
+
+      const count = Math.min(maximum, Math.max(1, Math.ceil(video.duration * 2)));
+      const endTime = Math.max(0, video.duration - 0.05);
+      const frames = [];
+
+      for (let i = 0; i < count; i++) {
+        const time = count === 1 ? 0 : endTime * i / (count - 1);
+        if (i > 0) {
+          const seekReady = waitFor(video, "seeked");
+          video.currentTime = time;
+          await seekReady;
+        }
+        frames.push({
+          canvas: toCanvas(video),
+          frameIndex: i,
+          timeSeconds: Number(time.toFixed(2))
+        });
+      }
+      return frames;
+    } finally {
+      video.removeAttribute("src");
+      video.load();
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  function perceptualHash(canvas) {
+    const tiny = document.createElement("canvas");
+    tiny.width = 32;
+    tiny.height = 32;
+    const context = tiny.getContext("2d", { willReadFrequently: true });
+    context.drawImage(canvas, 0, 0, 32, 32);
+    const pixels = context.getImageData(0, 0, 32, 32).data;
+
+    const gray = new Float64Array(32 * 32);
+    for (let i = 0; i < gray.length; i++) {
+      const p = i * 4;
+      gray[i] = 0.299 * pixels[p] + 0.587 * pixels[p + 1] + 0.114 * pixels[p + 2];
+    }
+
+    const coefficients = [];
+    for (let u = 0; u < 8; u++) {
+      for (let v = 0; v < 8; v++) {
+        let sum = 0;
+        for (let y = 0; y < 32; y++) {
+          for (let x = 0; x < 32; x++) {
+            sum += gray[y * 32 + x]
+              * Math.cos(((2 * x + 1) * u * Math.PI) / 64)
+              * Math.cos(((2 * y + 1) * v * Math.PI) / 64);
+          }
+        }
+        coefficients.push(sum);
+      }
+    }
+
+    const sorted = coefficients.slice(1).sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    return coefficients.map(value => value > median ? "1" : "0").join("");
+  }
+
+  function hashDistance(a, b) {
+    let distance = 0;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) distance++;
+    }
+    return distance;
+  }
+
+  async function loadReferences(files) {
+    const references = [];
+    for (const file of files) {
+      if (!file.type.startsWith("image/")) continue;
+      try {
+        const bitmap = await createImageBitmap(file);
+        const canvas = toCanvas(bitmap);
+        bitmap.close();
+        references.push({
+          name: file.name,
+          hash: perceptualHash(canvas)
+        });
+      } catch {
+        // Ignore reference images this browser cannot decode.
+      }
+    }
+    return references;
+  }
+
+  function scoreAsFake(classScores, terms) {
+    const matches = classScores.filter(item =>
+      terms.some(term => item.label.toLowerCase().includes(term))
+    );
+
+    if (matches.length) {
+      return {
+        score: Math.min(1, matches.reduce((sum, item) => sum + item.score, 0)),
+        labels: matches.map(item => item.label),
+        basis: "Matched fake/manipulation class labels"
+      };
+    }
+
+    const realMatches = classScores.filter(item =>
+      /real|authentic/i.test(item.label)
+    );
+    if (realMatches.length) {
+      const realScore = realMatches.reduce((sum, item) => sum + item.score, 0);
+      return {
+        score: Math.max(0, Math.min(1, 1 - realScore)),
+        labels: realMatches.map(item => item.label),
+        basis: "One minus matched real/authentic class score"
+      };
+    }
+
+    return {
+      score: null,
+      labels: [],
+      basis: "No matching class label; check the model labels"
+    };
+  }
+
+  async function getClassifier(modelId) {
+    if (classifier && loadedModelId === modelId) return classifier;
+
+    setStatus("Loading the model. First use may download model files...");
+    classifier = await pipeline("image-classification", modelId);
+    loadedModelId = modelId;
+    return classifier;
+  }
+
+  function addText(parent, tag, text, className = "") {
+    const element = document.createElement(tag);
+    element.textContent = text;
+    if (className) element.className = className;
+    parent.append(element);
+    return element;
+  }
+
+  function renderReport(file, frameReports, references, threshold) {
+    resultContent.replaceChildren();
+
+    const knownScores = frameReports
+      .map(frame => frame.fakeScore)
+      .filter(score => score !== null);
+    const mean = knownScores.length
+      ? knownScores.reduce((sum, score) => sum + score, 0) / knownScores.length
+      : null;
+
+    const summary = document.createElement("article");
+    summary.className = "result-card";
+    addText(summary, "h3", file.name);
+    addText(summary, "p",
+      mean === null
+        ? "No fake score was calculated. Check the model's class labels or change the fake label text."
+        : `Mean sampled-frame score for matching fake labels: ${(mean * 100).toFixed(1)}%. This is an uncalibrated model score, not proof.`,
+      mean === null ? "muted" : "score"
+    );
+    addText(summary, "p",
+      `Frames analyzed: ${frameReports.length}. Source attribution: not established.`
+    );
+    resultContent.append(summary);
+
+    const bestMatches = new Map();
+    for (const frame of frameReports) {
+      for (const match of frame.referenceMatches) {
+        const prior = bestMatches.get(match.name);
+        if (!prior || match.distance < prior.distance) {
+          bestMatches.set(match.name, {
+            ...match,
+            timeSeconds: frame.timeSeconds
+          });
+        }
+      }
+    }
+
+    const mapping = document.createElement("article");
+    mapping.className = "result-card";
+    addText(mapping, "h3", "Reference-image matches");
+    if (bestMatches.size === 0) {
+      addText(mapping, "p",
+        references.length
+          ? "No close visual matches found in the selected reference images."
+          : "No reference images were selected.",
+        "muted"
+      );
+    } else {
+      const list = document.createElement("ul");
+      [...bestMatches.values()]
+        .sort((a, b) => a.distance - b.distance)
+        .forEach(match => {
+          const when = match.timeSeconds === null
+            ? `frame ${match.frameIndex}`
+            : `${match.timeSeconds}s`;
+          addText(
+            list,
+            "li",
+            `${match.name} — distance ${match.distance}/64, matched at ${when}`
+          );
+        });
+      mapping.append(list);
+      addText(mapping, "p",
+        `Matches use perceptual similarity (threshold ${threshold}/64); they do not prove origin.`,
+        "muted"
+      );
+    }
+    resultContent.append(mapping);
+
+    for (const frame of frameReports) {
+      const card = document.createElement("article");
+      card.className = "result-card";
+      const where = frame.timeSeconds === null
+        ? `Frame ${frame.frameIndex}`
+        : `Frame ${frame.frameIndex} at ${frame.timeSeconds}s`;
+      addText(card, "h3", where);
+      addText(card, "p",
+        frame.fakeScore === null
+          ? frame.scoreBasis
+          : `${frame.scoreBasis}: ${(frame.fakeScore * 100).toFixed(1)}%`,
+        frame.fakeScore === null ? "muted" : "score"
+      );
+
+      const list = document.createElement("ul");
+      frame.classScores.slice(0, 5).forEach(item => {
+        addText(list, "li", `${item.label}: ${(item.score * 100).toFixed(1)}%`);
+      });
+      card.append(list);
+      resultContent.append(card);
+    }
+
+    results.hidden = false;
+  }
+
+  analyzeButton.addEventListener("click", async () => {
+    analyzeButton.disabled = true;
+    results.hidden = true;
+    resultContent.replaceChildren();
+
+    try {
+      const file = mediaInput.files[0];
+      const modelId = modelInput.value.trim();
+      const maxFrames = Number(frameCountInput.value);
+      const threshold = Number(distanceInput.value);
+      const terms = fakeLabelsInput.value
+        .split(",")
+        .map(term => term.trim().toLowerCase())
+        .filter(Boolean);
+
+      if (!file) throw new Error("Choose an image or video first.");
+      if (!modelId) throw new Error("Enter a browser-compatible model repository ID.");
+      if (!Number.isInteger(maxFrames) || maxFrames < 1 || maxFrames > 16) {
+        throw new Error("Frame count must be from 1 to 16.");
+      }
+      if (!Number.isInteger(threshold) || threshold < 0 || threshold > 64) {
+        throw new Error("Match distance must be from 0 to 64.");
+      }
+      if (terms.length === 0) throw new Error("Enter at least one fake class label.");
+
+      const model = await getClassifier(modelId);
+      setStatus("Reading selected media in this page...");
+      const frames = await getFrames(file, maxFrames);
+      setStatus("Preparing reference-image comparisons...");
+      const references = await loadReferences([...referenceInput.files]);
+      const referenceHashes = references.map(reference => ({
+        ...reference,
+        key: perceptualHashFromHash(reference.hash)
+      }));
+
+      const frameReports = [];
+      for (let i = 0; i < frames.length; i++) {
+        setStatus(`Analyzing frame ${i + 1} of ${frames.length}...`);
+        const frame = frames[i];
+        const rawScores = await model(frame.canvas, { top_k: null });
+        const classScores = (Array.isArray(rawScores) ? rawScores : [])
+          .map(item => ({ label: String(item.label), score: Number(item.score) }))
+          .filter(item => Number.isFinite(item.score));
+
+        const fake = scoreAsFake(classScores, terms);
+        const hash = perceptualHash(frame.canvas);
+        const referenceMatches = referenceHashes
+          .map(reference => ({
+            name: reference.name,
+            distance: hashDistance(hash, reference.key)
+          }))
+          .filter(match => match.distance <= threshold)
+          .sort((a, b) => a.distance - b.distance)
+          .slice(0, 5);
+
+        frameReports.push({
+          frameIndex: frame.frameIndex,
+          timeSeconds: frame.timeSeconds,
+          classScores,
+          fakeScore: fake.score,
+          scoreBasis: fake.basis,
+          referenceMatches
+        });
+      }
+
+      renderReport(file, frameReports, references, threshold);
+      setStatus("Review complete. Interpret scores and matches as leads only.");
+    } catch (error) {
+      setStatus(`Could not analyze media: ${error.message}`);
+    } finally {
+      analyzeButton.disabled = false;
+    }
+  });
+
+  // Reference hashes are already strings; this helper keeps the comparison
+  // path explicit and easy to change if a different hash format is used.
+  function perceptualHashFromHash(hash) {
+    return hash;
+  }
+</script>
+</body>
+</html>
